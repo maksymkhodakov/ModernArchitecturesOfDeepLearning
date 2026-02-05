@@ -1,28 +1,17 @@
 ############################################################
-# Лабораторна робота №2 (повний робочий скрипт)
-# Тема: CNN у R (keras/tensorflow) + Індивідуальне завдання №9
-# Аугментація: none vs flip vs flip+rotation vs full set
-#
-# Датасет: Fashion-MNIST (28x28x1, 10 класів)
-#
-# Функціонал:
-# 1) Підготовка середовища + відтворюваність (seed)
-# 2) Завантаження/нормалізація даних
-# 3) CNN з Conv/Pool/BN/Dropout
-# 4) Колбеки EarlyStopping + ReduceLROnPlateau
-# 5) Навчання CNN у 4 сценаріях аугментації (індивідуальне завдання)
-# 6) Графіки train/val accuracy та loss
-# 7) Оцінка на тесті, confusion matrix + yardstick метрики
-# 8) Порівняння з MLP
-# 9) Збереження/відновлення найкращої CNN (SavedModel)
-# 10) Вивід версій пакетів і TF для відтворюваності
+# Лабораторна робота №2
+# CNN у R (keras/tensorflow) + Індивідуальне завдання №9
+# Аугментація: flip vs flip+rotation vs full set
+# Датасет: Fashion-MNIST
+# Сумісно з Keras 3 / TF 2.20
 ############################################################
 
-# --- 0) Підготовка середовища ------------------------------------------------
-req <- c("keras", "tensorflow", "ggplot2", "dplyr", "yardstick", "tibble")
+# --- 0) Пакети --------------------------------------------------------------
+req <- c("reticulate","keras","tensorflow","ggplot2","dplyr","yardstick","tibble")
 to_install <- setdiff(req, rownames(installed.packages()))
 if (length(to_install)) install.packages(to_install, dependencies = TRUE)
 
+library(reticulate)
 library(keras)
 library(tensorflow)
 library(ggplot2)
@@ -30,139 +19,161 @@ library(dplyr)
 library(yardstick)
 library(tibble)
 
-# (перший раз) інсталяція бекенду TF — розкоментуй за потреби:
-# tensorflow::install_tensorflow()
+# --- 0.1) SSL fix для завантаження датасету (якщо треба) ---------------------
+py_install("certifi", pip = TRUE)
+ca_path <- tryCatch(py_eval("(__import__('certifi')).where()"), error = function(e) NA)
+if (!is.na(ca_path) && is.character(ca_path) && length(ca_path) == 1 && file.exists(ca_path)) {
+  Sys.setenv(SSL_CERT_FILE = ca_path)
+  Sys.setenv(REQUESTS_CA_BUNDLE = ca_path)
+  Sys.setenv(CURL_CA_BUNDLE = ca_path)
+}
 
-# Відтворюваність
+# --- 0.2) Відтворюваність ---------------------------------------------------
 set.seed(42)
-tensorflow::tf$random$set_seed(42L)
+tf$random$set_seed(42L)
 
 cat("R:", R.version.string, "\n")
 cat("TensorFlow:", tf$version$VERSION, "\n")
 cat("Keras (R package):", as.character(packageVersion("keras")), "\n\n")
 
-# --- 1) Завантаження і підготовка даних -------------------------------------
+# --- 1) Дані: Fashion-MNIST -------------------------------------------------
 mnist <- dataset_fashion_mnist()
-c(x_train, y_train) %<-% mnist$train
+c(x_all, y_all) %<-% mnist$train
 c(x_test, y_test) %<-% mnist$test
 
-# Нормалізація [0,1]
-x_train <- x_train / 255
-x_test  <- x_test / 255
+# нормалізація
+x_all  <- x_all / 255
+x_test <- x_test / 255
 
-# Додати канал (N, 28, 28, 1)
-x_train <- array_reshape(x_train, c(nrow(x_train), 28, 28, 1))
-x_test  <- array_reshape(x_test,  c(nrow(x_test),  28, 28, 1))
+# переконаємося що dtype правильний
+x_all <- array(as.numeric(x_all), dim = dim(x_all))
+x_test <- array(as.numeric(x_test), dim = dim(x_test))
 
+# додати канал
+x_all  <- array_reshape(x_all,  c(nrow(x_all),  28, 28, 1))
+x_test <- array_reshape(x_test, c(nrow(x_test), 28, 28, 1))
+
+# !!! важливо: мітки як integer
+y_all  <- as.integer(y_all)
+y_test <- as.integer(y_test)
+
+input_shape <- c(28,28,1)
 num_classes <- 10L
-input_shape <- c(28, 28, 1)
 
-# Назви класів
 class_names <- c(
   "T-shirt/top","Trouser","Pullover","Dress","Coat",
   "Sandal","Shirt","Sneaker","Bag","Ankle boot"
 )
 
-# --- 2) Функції: аугментація, моделі, колбеки -------------------------------
+# --- 1.1) Явний train/val split ----------------------------------------------
+n_all <- dim(x_all)[1]
+val_frac <- 0.2
+n_val <- as.integer(round(n_all * val_frac))
+n_train <- n_all - n_val
 
-# 2.1) Блок аугментації (preprocessing layers)
-# mode: "none" | "flip" | "flip_rot" | "full"
-build_augmentation <- function(mode = c("none", "flip", "flip_rot", "full")) {
+idx <- sample.int(n_all)
+idx_train <- idx[1:n_train]
+idx_val   <- idx[(n_train + 1):n_all]
+
+x_train <- x_all[idx_train,,, , drop = FALSE]
+y_train <- y_all[idx_train]
+x_val   <- x_all[idx_val,,, , drop = FALSE]
+y_val   <- y_all[idx_val]
+
+cat(sprintf("Split: train=%d, val=%d, test=%d\n", length(y_train), length(y_val), length(y_test)))
+
+# Конвертація в TensorFlow tensors
+x_train_tf <- tf$constant(x_train, dtype = tf$float32)
+y_train_tf <- tf$constant(y_train, dtype = tf$int64)
+x_val_tf <- tf$constant(x_val, dtype = tf$float32)
+y_val_tf <- tf$constant(y_val, dtype = tf$int64)
+x_test_tf <- tf$constant(x_test, dtype = tf$float32)
+y_test_tf <- tf$constant(y_test, dtype = tf$int64)
+
+# --- 2) Аугментація (preprocessing layers) ----------------------------------
+build_aug_layers <- function(mode = c("flip","flip_rot","full")) {
   mode <- match.arg(mode)
-
-  if (mode == "none") {
-    return(NULL) # немає аугментації
-  }
+  
   if (mode == "flip") {
-    return(
-      keras_model_sequential(name = "aug_flip") |>
-        layer_random_flip(mode = "horizontal")
-    )
+    return(list(layer_random_flip(mode = "horizontal")))
   }
   if (mode == "flip_rot") {
-    return(
-      keras_model_sequential(name = "aug_flip_rot") |>
-        layer_random_flip(mode = "horizontal") |>
-        layer_random_rotation(factor = 0.1)
-    )
+    return(list(
+      layer_random_flip(mode = "horizontal"),
+      layer_random_rotation(factor = 0.1)
+    ))
   }
-
   # full
-  keras_model_sequential(name = "aug_full") |>
-    layer_random_flip(mode = "horizontal") |>
-    layer_random_rotation(factor = 0.1) |>
-    layer_random_translation(height_factor = 0.1, width_factor = 0.1) |>
+  list(
+    layer_random_flip(mode = "horizontal"),
+    layer_random_rotation(factor = 0.1),
+    layer_random_translation(height_factor = 0.1, width_factor = 0.1),
     layer_random_zoom(height_factor = 0.1, width_factor = 0.1)
+  )
 }
 
-# 2.2) CNN модель (важливо: у R НЕ можна робити |> aug |> ...)
-# тому аугментацію додаємо через layer(aug) або без неї
-build_cnn <- function(aug_mode = c("none", "flip", "flip_rot", "full"),
+# --- 3) CNN (Functional API) -------------------------------------------------
+build_cnn <- function(aug_mode = c("flip","flip_rot","full"),
                       input_shape = c(28,28,1),
                       num_classes = 10L,
                       lr = 1e-3) {
   aug_mode <- match.arg(aug_mode)
-  aug <- build_augmentation(aug_mode)
-
-  model <- keras_model_sequential(name = paste0("cnn_", aug_mode))
-
-  # Додаємо аугментацію як перший шар, якщо вона є
-  if (!is.null(aug)) {
-    model <- model |> layer(aug)
+  
+  inputs <- layer_input(shape = input_shape, name = "input")
+  x <- inputs
+  
+  aug_layers <- build_aug_layers(aug_mode)
+  if (length(aug_layers) > 0) {
+    for (L in aug_layers) x <- L(x)
   }
-
-  # Основна CNN-архітектура
-  model <- model |>
-    layer_conv_2d(filters = 32, kernel_size = 3, padding = "same",
-                  activation = "relu", input_shape = input_shape) |>
+  
+  x <- x |>
+    layer_conv_2d(32, 3, padding = "same", activation = "relu") |>
     layer_batch_normalization() |>
-    layer_conv_2d(filters = 32, kernel_size = 3, activation = "relu") |>
-    layer_max_pooling_2d(pool_size = 2) |>
+    layer_conv_2d(32, 3, activation = "relu") |>
+    layer_max_pooling_2d(2) |>
     layer_dropout(0.25) |>
-
-    layer_conv_2d(filters = 64, kernel_size = 3, padding = "same",
-                  activation = "relu") |>
+    layer_conv_2d(64, 3, padding = "same", activation = "relu") |>
     layer_batch_normalization() |>
-    layer_conv_2d(filters = 64, kernel_size = 3, activation = "relu") |>
-    layer_max_pooling_2d(pool_size = 2) |>
+    layer_conv_2d(64, 3, activation = "relu") |>
+    layer_max_pooling_2d(2) |>
     layer_dropout(0.25) |>
-
     layer_flatten() |>
     layer_dense(128, activation = "relu") |>
-    layer_dropout(0.5) |>
-    layer_dense(num_classes, activation = "softmax")
-
-  model |>
-    compile(
-      loss = "sparse_categorical_crossentropy",
-      optimizer = optimizer_adam(learning_rate = lr),
-      metrics = c("accuracy")
-    )
-
+    layer_dropout(0.5)
+  
+  outputs <- x |> layer_dense(num_classes, activation = "softmax", name = "pred")
+  model <- keras_model(inputs, outputs, name = paste0("cnn_", aug_mode))
+  
+  model$compile(
+    loss = "sparse_categorical_crossentropy",
+    optimizer = optimizer_adam(learning_rate = lr),
+    metrics = list("accuracy")
+  )
   model
 }
 
-# 2.3) MLP (baseline для порівняння)
+# --- 4) MLP baseline ---------------------------------------------------------
 build_mlp <- function(input_shape = c(28,28,1), num_classes = 10L, lr = 1e-3) {
-  model <- keras_model_sequential(name = "mlp_baseline") |>
-    layer_flatten(input_shape = input_shape) |>
+  inputs <- layer_input(shape = input_shape)
+  x <- inputs |>
+    layer_flatten() |>
     layer_dense(512, activation = "relu") |>
     layer_dropout(0.5) |>
     layer_dense(256, activation = "relu") |>
-    layer_dropout(0.5) |>
-    layer_dense(num_classes, activation = "softmax")
-
-  model |>
-    compile(
-      loss = "sparse_categorical_crossentropy",
-      optimizer = optimizer_adam(learning_rate = lr),
-      metrics = c("accuracy")
-    )
-
+    layer_dropout(0.5)
+  outputs <- x |> layer_dense(num_classes, activation = "softmax")
+  
+  model <- keras_model(inputs, outputs, name = "mlp_baseline")
+  model$compile(
+    loss = "sparse_categorical_crossentropy",
+    optimizer = optimizer_adam(learning_rate = lr),
+    metrics = list("accuracy")
+  )
   model
 }
 
-# 2.4) Колбеки
+# --- 5) Callbacks + helpers --------------------------------------------------
 make_callbacks <- function() {
   list(
     callback_early_stopping(monitor = "val_loss", patience = 5, restore_best_weights = TRUE),
@@ -170,24 +181,31 @@ make_callbacks <- function() {
   )
 }
 
-# 2.5) Перетворення history -> tibble
-history_to_df <- function(history, tag = "model") {
+history_to_df <- function(history, tag) {
   tibble(
-    epoch = seq_along(history$metrics$loss),
-    loss = history$metrics$loss,
-    val_loss = history$metrics$val_loss,
-    acc = history$metrics$accuracy,
-    val_acc = history$metrics$val_accuracy,
+    epoch = seq_along(history$history$loss),
+    loss = history$history$loss,
+    val_loss = history$history$val_loss,
+    acc = history$history$accuracy,
+    val_acc = history$history$val_accuracy,
     model = tag
   )
 }
 
-# --- 3) Навчання CNN: 4 сценарії аугментації (індивідуальне завдання №9) ----
-aug_scenarios <- c("none", "flip", "flip_rot", "full")
+# --- 6) НАВЧАННЯ CNN: індивідуальне №9 (3 сценарії) --------------------------
+# Вимога: flip vs flip+rotation vs full set
+cat("\n===============================================\n")
+cat("ІНДИВІДУАЛЬНЕ ЗАВДАННЯ №9\n")
+cat("Порівняння 3 сценаріїв аугментації:\n")
+cat("1. Тільки flip (horizontal)\n")
+cat("2. Flip + rotation\n")
+cat("3. Повний набір (flip + rotation + translation + zoom)\n")
+cat("===============================================\n\n")
 
-epochs <- 30
-batch_size <- 128
-val_split <- 0.2
+aug_scenarios <- c("flip","flip_rot","full")
+
+epochs <- 5
+batch_size <- 128L
 cb <- make_callbacks()
 
 histories <- list()
@@ -198,87 +216,139 @@ for (mode in aug_scenarios) {
   cat("\n=============================\n")
   cat("Training CNN with aug_mode:", mode, "\n")
   cat("=============================\n")
-
-  model_cnn <- build_cnn(
-    aug_mode = mode,
-    input_shape = input_shape,
-    num_classes = num_classes,
-    lr = 1e-3
+  
+  model_cnn <- build_cnn(mode, input_shape, num_classes, lr = 1e-3)
+  
+  history <- model_cnn$fit(
+    x = x_train_tf, 
+    y = y_train_tf,
+    validation_data = list(x_val_tf, y_val_tf),
+    epochs = as.integer(epochs),
+    batch_size = as.integer(batch_size),
+    callbacks = cb,
+    verbose = 2
   )
-
-  history <- model_cnn |>
-    fit(
-      x = x_train, y = y_train,
-      validation_split = val_split,
-      epochs = epochs,
-      batch_size = batch_size,
-      callbacks = cb,
-      verbose = 2
-    )
-
+  
   models[[mode]] <- model_cnn
   histories[[mode]] <- history
-
-  dfh <- history_to_df(history, tag = paste0("cnn_", mode))
-
+  
+  dfh <- history_to_df(history, paste0("cnn_", mode))
+  
   summary_rows[[mode]] <- dfh |>
     summarize(
       aug_mode = mode,
-      best_val_acc = max(val_acc, na.rm = TRUE),
+      best_val_acc  = max(val_acc, na.rm = TRUE),
       best_val_loss = min(val_loss, na.rm = TRUE),
-      final_val_acc = last(val_acc),
-      final_val_loss = last(val_loss)
+      final_val_acc  = dplyr::last(val_acc),
+      final_val_loss = dplyr::last(val_loss),
+      epochs_trained = n()
     )
 }
 
-summary_tbl <- bind_rows(summary_rows) |>
-  arrange(desc(best_val_acc))
+summary_tbl <- bind_rows(summary_rows) |> arrange(desc(best_val_acc))
 
-cat("\n--- Augmentation comparison (индив. завдання №9) ---\n")
+cat("\n\n===============================================\n")
+cat("РЕЗУЛЬТАТИ ІНДИВІДУАЛЬНОГО ЗАВДАННЯ №9\n")
+cat("Порівняння 3 сценаріїв аугментації\n")
+cat("===============================================\n")
 print(summary_tbl)
 
-# --- 4) Графіки навчання (всі сценарії) -------------------------------------
+# Аналіз результатів
+cat("\n--- АНАЛІЗ ---\n")
+best_aug <- summary_tbl$aug_mode[1]
+cat(sprintf("Найкраща аугментація: %s (val_acc = %.4f)\n", 
+            best_aug, summary_tbl$best_val_acc[1]))
+
+cat("\nПорівняння best_val_acc:\n")
+for(i in 1:nrow(summary_tbl)) {
+  cat(sprintf("  %d. %s: %.4f\n", i, summary_tbl$aug_mode[i], summary_tbl$best_val_acc[i]))
+}
+
+# --- 7) Візуалізація (за вимогою) -------------------------------------------
 df_hist_all <- bind_rows(lapply(names(histories), function(mode) {
   history_to_df(histories[[mode]], tag = paste0("cnn_", mode))
 }))
 
-# Validation Accuracy (головне для порівняння аугментації)
-ggplot(df_hist_all, aes(x = epoch, y = val_acc, color = model)) +
-  geom_line() +
-  labs(title = "CNN: Validation Accuracy (порівняння аугментацій)",
-       x = "Epoch", y = "Val Accuracy") +
-  theme(legend.position = "bottom")
+# (A) порівняння val_acc - ГОЛОВНИЙ ГРАФІК для завдання
+p_val_acc <- ggplot(df_hist_all, aes(epoch, val_acc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2, alpha = 0.6) +
+  labs(title = "Індивідуальне завдання №9: Validation Accuracy",
+       subtitle = "Порівняння: flip vs flip+rotation vs full augmentation",
+       x = "Epoch", y = "Validation Accuracy",
+       color = "Augmentation") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 11))
+print(p_val_acc)
 
-# Validation Loss
-ggplot(df_hist_all, aes(x = epoch, y = val_loss, color = model)) +
-  geom_line() +
-  labs(title = "CNN: Validation Loss (порівняння аугментацій)",
-       x = "Epoch", y = "Val Loss") +
-  theme(legend.position = "bottom")
+# (B) порівняння val_loss
+p_val_loss <- ggplot(df_hist_all, aes(epoch, val_loss, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2, alpha = 0.6) +
+  labs(title = "Індивідуальне завдання №9: Validation Loss",
+       subtitle = "Порівняння: flip vs flip+rotation vs full augmentation",
+       x = "Epoch", y = "Validation Loss",
+       color = "Augmentation") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 11))
+print(p_val_loss)
 
-# (Опційно) по фасетах — зручно для звіту
-ggplot(df_hist_all, aes(epoch, val_acc)) +
-  geom_line() +
-  facet_wrap(~ model, ncol = 2) +
-  labs(title = "CNN: Val Accuracy по сценаріях", y = "Val Accuracy")
+# (C) фасети для звіту
+print(
+  ggplot(df_hist_all, aes(epoch, val_acc)) +
+    geom_line(color = "steelblue", linewidth = 1) +
+    geom_point(color = "steelblue", size = 1.5, alpha = 0.6) +
+    facet_wrap(~ model, ncol = 3) +
+    labs(title = "Val Accuracy по сценаріях (фасети)", 
+         y = "Val Accuracy", x = "Epoch") +
+    theme_minimal()
+)
 
-ggplot(df_hist_all, aes(epoch, val_loss)) +
-  geom_line() +
-  facet_wrap(~ model, ncol = 2) +
-  labs(title = "CNN: Val Loss по сценаріях", y = "Val Loss")
+print(
+  ggplot(df_hist_all, aes(epoch, val_loss)) +
+    geom_line(color = "coral", linewidth = 1) +
+    geom_point(color = "coral", size = 1.5, alpha = 0.6) +
+    facet_wrap(~ model, ncol = 3) +
+    labs(title = "Val Loss по сценаріях (фасети)", 
+         y = "Val Loss", x = "Epoch") +
+    theme_minimal()
+)
 
-# --- 5) Вибір найкращого CNN за best_val_acc --------------------------------
+# (D) Барплот порівняння best_val_acc
+bar_data <- summary_tbl |> 
+  mutate(aug_mode = factor(aug_mode, levels = c("flip", "flip_rot", "full")))
+
+p_bar <- ggplot(bar_data, aes(x = aug_mode, y = best_val_acc, fill = aug_mode)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.4f", best_val_acc)), 
+            vjust = -0.5, size = 4) +
+  labs(title = "Порівняння найкращої Validation Accuracy",
+       subtitle = "Індивідуальне завдання №9",
+       x = "Тип аугментації", y = "Best Validation Accuracy") +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14))
+print(p_bar)
+
+# --- 8) Найкраща модель і тестова оцінка ------------------------------------
 best_mode <- summary_tbl$aug_mode[1]
-cat("\nBest augmentation mode by best_val_acc:", best_mode, "\n")
+cat("\n\n===============================================\n")
+cat("ТЕСТУВАННЯ НАЙКРАЩОЇ МОДЕЛІ\n")
+cat("===============================================\n")
+cat("Best augmentation mode:", best_mode, "\n")
 best_cnn <- models[[best_mode]]
 
-# --- 6) Оцінка на тесті + confusion matrix + yardstick метрики --------------
 cat("\n--- Test evaluation (best CNN) ---\n")
-best_eval <- best_cnn |> evaluate(x_test, y_test, verbose = 0)
+best_eval <- best_cnn$evaluate(x_test_tf, y_test_tf, verbose = 0)
 print(best_eval)
 
-pred_prob <- best_cnn |> predict(x_test, verbose = 0)
-pred_cls <- max.col(pred_prob) - 1L  # 0..9
+pred_prob <- best_cnn$predict(x_test_tf, verbose = 0)
+pred_cls <- max.col(pred_prob) - 1L
 
 conf <- table(
   Predicted = factor(pred_cls, levels = 0:9, labels = class_names),
@@ -287,78 +357,120 @@ conf <- table(
 cat("\n--- Confusion matrix (best CNN) ---\n")
 print(conf)
 
-# Heatmap confusion matrix (для рисунку у звіт)
-conf_df <- as.data.frame(conf) |>
-  rename(n = Freq)
+conf_df <- as.data.frame(conf) |> rename(n = Freq)
+print(
+  ggplot(conf_df, aes(x = Actual, y = Predicted, fill = n)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = n), color = "white", size = 3) +
+    scale_fill_gradient(low = "steelblue", high = "darkred") +
+    labs(title = paste("Confusion Matrix - Best CNN:", best_mode),
+         x = "Actual Class", y = "Predicted Class") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+)
 
-ggplot(conf_df, aes(x = Actual, y = Predicted, fill = n)) +
-  geom_tile() +
-  labs(title = paste("Confusion Matrix (best CNN:", best_mode, ")"),
-       x = "Actual", y = "Predicted") +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))
-
-# Метрики
 df_pred <- tibble(
   truth = factor(y_test, levels = 0:9, labels = class_names),
   estimate = factor(pred_cls, levels = 0:9, labels = class_names)
 )
 
 cat("\nAccuracy (best CNN):\n")
-print(accuracy(df_pred, truth = truth, estimate = estimate))
+acc_result <- accuracy(df_pred, truth = truth, estimate = estimate)
+print(acc_result)
 
 cat("\nF1 macro (best CNN):\n")
-print(f_meas(df_pred, truth = truth, estimate = estimate, estimator = "macro"))
+f1_result <- f_meas(df_pred, truth = truth, estimate = estimate, estimator = "macro")
+print(f1_result)
 
-# --- 7) Порівняння CNN vs MLP -----------------------------------------------
+# --- 9) CNN vs MLP -----------------------------------------------------------
 cat("\n=============================\n")
-cat("Training MLP baseline (no augmentation)\n")
+cat("Training MLP baseline\n")
 cat("=============================\n")
 
-model_mlp <- build_mlp(input_shape = input_shape, num_classes = num_classes, lr = 1e-3)
-cb_mlp <- make_callbacks()
-
-hist_mlp <- model_mlp |>
-  fit(
-    x = x_train, y = y_train,
-    validation_split = val_split,
-    epochs = 20,
-    batch_size = batch_size,
-    callbacks = cb_mlp,
-    verbose = 2
-  )
+model_mlp <- build_mlp(input_shape, num_classes, lr = 1e-3)
+hist_mlp <- model_mlp$fit(
+  x = x_train_tf,
+  y = y_train_tf,
+  validation_data = list(x_val_tf, y_val_tf),
+  epochs = as.integer(5),
+  batch_size = as.integer(batch_size),
+  callbacks = cb,
+  verbose = 2
+)
 
 cat("\n--- Test evaluation (MLP) ---\n")
-mlp_eval <- model_mlp |> evaluate(x_test, y_test, verbose = 0)
+mlp_eval <- model_mlp$evaluate(x_test_tf, y_test_tf, verbose = 0)
 print(mlp_eval)
 
 compare_tbl <- tibble(
   model = c(paste0("CNN_best(", best_mode, ")"), "MLP"),
-  test_loss = c(as.numeric(best_eval["loss"]), as.numeric(mlp_eval["loss"])),
-  test_acc  = c(as.numeric(best_eval["accuracy"]), as.numeric(mlp_eval["accuracy"]))
+  test_loss = c(as.numeric(best_eval[[1]]), as.numeric(mlp_eval[[1]])),  # перший елемент - loss
+  test_acc  = c(as.numeric(best_eval[[2]]), as.numeric(mlp_eval[[2]]))   # другий елемент - accuracy
 )
 cat("\n--- CNN vs MLP comparison ---\n")
 print(compare_tbl)
 
-# --- 8) Збереження / відновлення найкращої CNN ------------------------------
+# Графік порівняння CNN vs MLP
+p_compare <- ggplot(compare_tbl, aes(x = model, y = test_acc, fill = model)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = sprintf("%.4f", test_acc)), vjust = -0.5, size = 4) +
+  labs(title = "CNN (з найкращою аугментацією) vs MLP",
+       x = "Model", y = "Test Accuracy") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_minimal() +
+  theme(legend.position = "none")
+print(p_compare)
+
+# --- 10) Збереження / відновлення -------------------------------------------
 dir.create("models", showWarnings = FALSE, recursive = TRUE)
-cnn_save_path <- file.path("models", paste0("cnn_fashion_mnist_best_", best_mode))
+cnn_save_path <- file.path("models", paste0("cnn_fashion_mnist_best_", best_mode, ".keras"))
 
 cat("\nSaving best CNN to:", cnn_save_path, "\n")
-save_model_tf(best_cnn, cnn_save_path)
+best_cnn$save(cnn_save_path)
 
 cat("Loading model back...\n")
-restored <- load_model_tf(cnn_save_path)
+restored <- keras$models$load_model(cnn_save_path)
 
 cat("\n--- Test evaluation (restored CNN) ---\n")
-restored_eval <- restored |> evaluate(x_test, y_test, verbose = 0)
+restored_eval <- restored$evaluate(x_test_tf, y_test_tf, verbose = 0)
 print(restored_eval)
 
-# --- 9) Відтворюваність: версії пакетів -------------------------------------
-cat("\n--- Reproducibility info ---\n")
-cat("R version:\n")
-print(R.version.string)
+# --- 11) Відтворюваність -----------------------------------------------------
+cat("\n\n===============================================\n")
+cat("REPRODUCIBILITY INFO\n")
+cat("===============================================\n")
+cat("R version:", R.version.string, "\n")
+cat("TensorFlow version:", tf$version$VERSION, "\n")
+cat("Seeds used: set.seed(42), tf$random$set_seed(42L)\n\n")
 
-cat("\nPackage versions:\n")
-print(as.data.frame(installed.packages()[c("keras","tensorflow","ggplot2","dplyr","yardstick"), c("Package","Version")]))
+print(as.data.frame(installed.packages()[c("keras","tensorflow","ggplot2","dplyr","yardstick"),
+                                         c("Package","Version")]))
 
-cat("\nSeeds used: set.seed(42), tf$random$set_seed(42L)\n")
+# --- 12) ФІНАЛЬНИЙ ВИСНОВОК --------------------------------------------------
+cat("\n\n===============================================\n")
+cat("ВИСНОВКИ ПО ІНДИВІДУАЛЬНОМУ ЗАВДАННЮ №9\n")
+cat("===============================================\n\n")
+
+cat("Порівняння 3 сценаріїв аугментації:\n\n")
+
+for(i in 1:nrow(summary_tbl)) {
+  mode_name <- summary_tbl$aug_mode[i]
+  mode_desc <- switch(mode_name,
+                      "flip" = "Тільки горизонтальний flip",
+                      "flip_rot" = "Flip + обертання (±10°)",
+                      "full" = "Повний набір (flip + rotation + translation + zoom)")
+  cat(sprintf("%d. %s (%s)\n", i, mode_name, mode_desc))
+  cat(sprintf("   Best val_acc: %.4f\n", summary_tbl$best_val_acc[i]))
+  cat(sprintf("   Best val_loss: %.4f\n", summary_tbl$best_val_loss[i]))
+  cat(sprintf("   Epochs trained: %d\n\n", summary_tbl$epochs_trained[i]))
+}
+
+cat("Узагальнення:\n")
+cat(sprintf("- Найкраща аугментація: %s\n", best_aug))
+cat(sprintf("- Test accuracy найкращої моделі: %.4f\n", as.numeric(best_eval[[2]])))
+cat(sprintf("- Перевага CNN над MLP: %.4f\n", 
+            as.numeric(best_eval[[2]]) - as.numeric(mlp_eval[[2]])))
+
+cat("\nАугментація даних покращує узагальнення моделі та зменшує перенавчання.\n")
+cat("Складніші методи аугментації можуть як покращити, так і погіршити результати\n")
+cat("залежно від специфіки датасету.\n")
